@@ -1,0 +1,507 @@
+# (6) 設定環境變數，處理可能的 OMP/MKL 錯誤
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+from collections import defaultdict # For grouping motifs
+
+# (7) 設定 Matplotlib 支持中文顯示
+plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei'] # 指定字體
+plt.rcParams['axes.unicode_minus'] = False # 解決負號顯示問題
+
+# --- Helper Functions ---
+
+def z_normalize_tensor(ts_tensor):
+    """Z-normalizes a PyTorch tensor (time series subsequence)."""
+    mean = torch.mean(ts_tensor)
+    std = torch.std(ts_tensor)
+    # 增加一個小的 epsilon 防止除以零
+    # Use torch.clamp for safe division
+    std_safe = torch.clamp(std, min=1e-8)
+    return (ts_tensor - mean) / std_safe
+
+def calculate_distance_profile_tensor(query_normalized, subsequences_normalized, exclusion_zone):
+    """
+    Calculates the distance profile for a single query against all subsequences.
+    Avoids trivial matches using an exclusion zone around the query's index (implicit).
+
+    Args:
+        query_normalized (torch.Tensor): The single Z-normalized query subsequence (1D).
+        subsequences_normalized (torch.Tensor): All Z-normalized subsequences (2D: num_subsequences x length).
+        exclusion_zone (int): Radius around the query index to exclude.
+
+    Returns:
+        torch.Tensor: Distance profile (1D), containing distances from the query to all subsequences.
+                      Distances within the exclusion zone will be float('inf').
+    """
+    n_subs, l = subsequences_normalized.shape
+    query_expanded = query_normalized.unsqueeze(0).expand_as(subsequences_normalized) # Shape: (n_subs, l)
+
+    # Calculate squared Euclidean distances efficiently
+    # dist_sq = ||a - b||^2 = ||a||^2 + ||b||^2 - 2*a.b
+    # Since they are Z-normalized, ||a||^2 = ||b||^2 = l (approximately, due to numerical precision)
+    # So dist_sq ≈ 2*l - 2 * sum(a*b)
+    # Note: Direct subtraction is often more stable and clear, especially with PyTorch optimizations
+    dist_sq = torch.sum((query_expanded - subsequences_normalized)**2, dim=1) # Shape: (n_subs,)
+
+    # Ensure non-negative distances due to potential floating point errors
+    dist_sq = torch.clamp(dist_sq, min=0.0)
+    distances = torch.sqrt(dist_sq)
+
+    return distances
+
+# --- Time Series Simulation ---
+
+# (1) 時間序列的模擬
+def simulate_time_series_variable_motifs(n_points=1000, seed=42):
+    """
+    Generates a time series of size (#Time, 1) with variable-length cyclical patterns.
+    """
+    np.random.seed(seed)
+    time_vec = np.arange(n_points)
+    # 基線噪音
+    noise = np.random.randn(n_points) * 0.5
+    # 基線趨勢 (例如緩慢的正弦波)
+    baseline = 2 * np.sin(2 * np.pi * time_vec / (n_points / 2)) + noise
+
+    # 定義不同長度的樣態 (Motifs)
+    motif1_len = 50
+    motif1 = 5 * np.sin(2 * np.pi * np.arange(motif1_len) / (motif1_len / 2)) # 較短的樣態
+
+    motif2_len = 80
+    t_motif2 = np.arange(motif2_len)
+    motif2 = 4 * (-(t_motif2 - motif2_len/2)**2 / (motif2_len*5) + 1) # 較長的拋物線樣態
+
+    # 嵌入樣態到基線中
+    ts = baseline.copy()
+
+    # --- Embed motifs more clearly ---
+    locations = {
+        motif1_len: [100, 500],
+        motif2_len: [250, 700]
+    }
+    motifs = {
+        motif1_len: motif1,
+        motif2_len: motif2
+    }
+
+    for length, starts in locations.items():
+        motif = motifs[length]
+        for start_idx in starts:
+            if start_idx + length <= n_points:
+                ts[start_idx : start_idx + length] += motif
+
+    # 返回形狀為 (n_points, 1) 的 NumPy 陣列
+    return ts.reshape(-1, 1)
+
+# --- VALMOD Implementation (Revised) ---
+
+# (2) & (4) VALMOD 算法實現 (核心 VALMAP，無高級剪枝，含 Top-k)
+class Valmod:
+    def __init__(self, lmin, lmax, device='cpu'):
+        """
+        Initializes the Valmod detector.
+
+        Args:
+            lmin (int): Minimum motif length to search for.
+            lmax (int): Maximum motif length to search for.
+            device (str): 'cpu' or 'cuda' for PyTorch computations.
+        """
+        if not isinstance(lmin, int) or not isinstance(lmax, int) or lmin <= 0 or lmax < lmin:
+            raise ValueError("lmin and lmax must be positive integers with lmax >= lmin.")
+        self.lmin = lmin
+        self.lmax = lmax
+        self.device = torch.device(device)
+        if device == 'cuda' and not torch.cuda.is_available():
+            print("Warning: CUDA requested but not available. Falling back to CPU.")
+            self.device = torch.device('cpu')
+
+        # VALMAP components will be stored here after predict()
+        self.valmap_mpn = None # Variable Length Matrix Profile (Normalized distance)
+        self.valmap_ip = None  # Index Profile (Index of best match)
+        self.valmap_lp = None  # Length Profile (Length at which best match occurred)
+        self.data_len = None   # Length of the input data series
+        self.data_tensor = None # Store data tensor for later use (e.g., plotting)
+
+    def _compute_profile_for_length(self, T_tensor, l):
+        """
+        Computes the Matrix Profile (distance and index) for a single fixed length l.
+        NOTE: This implements the basic O(n^2*l) or O(n^2 log n) depending on FFT/tensor usage,
+              NOT the highly optimized LB-pruned version from the VALMOD paper.
+              It calculates the full profile for length `l`.
+
+        Args:
+            T_tensor (torch.Tensor): The input time series tensor (1D).
+            l (int): The subsequence length.
+
+        Returns:
+            tuple: (mp, ip) - Tensors containing the minimum distance and index for each subsequence.
+                   Returns (None, None) if length `l` is invalid for the data.
+        """
+        n = T_tensor.shape[0]
+        if l > n:
+            # print(f"Debug: Length {l} > data length {n}. Skipping.") # Reduce noise
+            return None, None
+
+        profile_len = n - l + 1
+        if profile_len <= 1: # Need at least 2 subsequences to find a non-trivial match
+             # print(f"Debug: Profile length {profile_len} too small for l={l}. Skipping.")
+             return None, None
+
+        # Initialize Matrix Profile (distances) and Profile Index (indices)
+        mp = torch.full((profile_len,), float('inf'), device=self.device, dtype=torch.float32)
+        ip = torch.full((profile_len,), -1, device=self.device, dtype=torch.long) # Use -1 for no match found initially
+
+        # --- Efficient Subsequence Extraction ---
+        # Use stride tricks (as implemented by unfold in PyTorch)
+        # shape: (profile_len, l)
+        subsequences = T_tensor.unfold(0, l, 1)
+
+        # --- Z-normalize all subsequences ---
+        # Apply Z-normalization row-wise (each subsequence)
+        # This can be parallelized on GPU
+        means = torch.mean(subsequences, dim=1, keepdim=True)
+        stds = torch.std(subsequences, dim=1, keepdim=True)
+        stds_safe = torch.clamp(stds, min=1e-8)
+        subsequences_normalized = (subsequences - means) / stds_safe
+
+        # --- Calculate Profile ---
+        # Trivial match exclusion window (common practice: non-overlapping)
+        exclusion_zone = l // 2 # Or set to `l` for strictly non-overlapping
+
+        # This loop is the main bottleneck O(n^2) for each length 'l'
+        for i in range(profile_len):
+            query_normalized = subsequences_normalized[i]
+
+            # Calculate distances from query 'i' to all others
+            # This step can leverage batch operations on GPU
+            distances = calculate_distance_profile_tensor(query_normalized, subsequences_normalized, exclusion_zone)
+
+            # Apply exclusion zone
+            start_excl = max(0, i - exclusion_zone)
+            end_excl = min(profile_len, i + exclusion_zone + 1)
+            distances[start_excl:end_excl] = float('inf') # Exclude trivial matches
+
+            # Find minimum distance and index
+            if torch.all(torch.isinf(distances)): # Check if all distances are inf (only trivial matches)
+                 min_dist = float('inf')
+                 best_j = -1
+            else:
+                 min_dist, best_j = torch.min(distances, dim=0)
+
+
+            mp[i] = min_dist
+            ip[i] = best_j # best_j will be index within the profile
+
+        # Convert potential inf back to a large number if needed for VALMAP, but inf is fine
+        mp = torch.nan_to_num(mp, nan=float('inf'), posinf=float('inf'), neginf=float('-inf'))
+
+        return mp, ip
+
+    def predict(self, T):
+        """
+        Detects variable length motifs using the VALMOD approach.
+        Builds the VALMAP structure by iterating through lengths.
+
+        Args:
+            T (numpy.ndarray): The input time series, shape (#Time, 1).
+
+        Returns:
+            tuple: (valmap_mpn, valmap_ip, valmap_lp)
+                   - valmap_mpn: Tensor with the best length-normalized distance found for each starting index.
+                   - valmap_ip: Tensor with the index of the best match corresponding to mpn.
+                   - valmap_lp: Tensor with the length at which the best match was found.
+                   Returns (None, None, None) if input is invalid or no motifs found.
+        """
+        if not isinstance(T, np.ndarray) or T.ndim != 2 or T.shape[1] != 1:
+            raise ValueError("Input time series T must be a NumPy array with shape (#Time, 1).")
+
+        self.data_len = T.shape[0]
+        self.data_tensor = torch.tensor(T.flatten(), dtype=torch.float32, device=self.device) # Store tensor
+
+        # Adjust lmax if it exceeds possible length
+        effective_lmax = min(self.lmax, self.data_len - 1) # Need at least 2 subsequences
+        if effective_lmax < self.lmin:
+             print(f"Error: Effective lmax ({effective_lmax}) is less than lmin ({self.lmin}). Cannot proceed.")
+             return None, None, None
+
+        print(f"Starting VALMOD prediction for lengths {self.lmin} to {effective_lmax} on device {self.device}...")
+        start_time_total = time.time()
+
+        # --- Initialize VALMAP based on lmin ---
+        print(f"Calculating initial profile for length l={self.lmin}...")
+        start_time_l = time.time()
+        mp_lmin, ip_lmin = self._compute_profile_for_length(self.data_tensor, self.lmin)
+        end_time_l = time.time()
+        print(f"Length {self.lmin} profile computed in {end_time_l - start_time_l:.2f} seconds.")
+
+
+        if mp_lmin is None:
+            print(f"Error: Could not compute initial profile for lmin={self.lmin}. Aborting.")
+            return None, None, None
+
+        # VALMAP components size matches the profile length of lmin
+        # Profile length = n - l + 1
+        valmap_size = self.data_len - self.lmin + 1
+        if valmap_size != mp_lmin.shape[0]:
+             print(f"Error: Initial profile size mismatch. Expected {valmap_size}, got {mp_lmin.shape[0]}.")
+             return None, None, None
+
+        # Length-normalize the initial distances (handle potential division by zero)
+        sqrt_lmin = np.sqrt(self.lmin) if self.lmin > 0 else 1.0
+        self.valmap_mpn = mp_lmin / sqrt_lmin
+        self.valmap_ip = ip_lmin
+        # Initialize Length Profile with lmin
+        self.valmap_lp = torch.full_like(self.valmap_mpn, self.lmin, dtype=torch.long, device=self.device)
+        print(f"Initial VALMAP created for l={self.lmin}.")
+
+
+        # --- Iterate and Update VALMAP for lmin+1 to lmax ---
+        # VALMAP size is fixed based on lmin. We update the relevant prefix.
+        for l in range(self.lmin + 1, effective_lmax + 1):
+            print(f"Processing length l={l}...")
+            start_time_l = time.time()
+            mp_l, ip_l = self._compute_profile_for_length(self.data_tensor, l)
+            end_time_l = time.time()
+
+            if mp_l is None: # Skip if length l was invalid (e.g., too long)
+                print(f"Skipping length {l} (invalid profile).")
+                continue
+            print(f"Length {l} profile computed in {end_time_l - start_time_l:.2f} seconds.")
+
+
+            # Calculate length-normalized distances for this length
+            sqrt_l = np.sqrt(l)
+            mpn_l = mp_l / sqrt_l
+
+            # Determine the range of indices in VALMAP to potentially update
+            # Profile for length l has size n-l+1
+            # We only need to update the first 'update_len' elements of the VALMAP
+            update_len = self.data_len - l + 1
+            if update_len <= 0: continue # Should not happen based on effective_lmax check
+
+            # --- VALMAP Update Logic ---
+            # Compare the new normalized distances (mpn_l) with the current best
+            # stored in the VALMAP (only for the relevant prefix).
+            current_best_mpn_prefix = self.valmap_mpn[:update_len]
+            new_is_better = mpn_l < current_best_mpn_prefix
+
+            # Apply updates using boolean indexing (efficient on GPU/CPU)
+            self.valmap_mpn[:update_len][new_is_better] = mpn_l[new_is_better]
+            self.valmap_ip[:update_len][new_is_better] = ip_l[new_is_better]
+            self.valmap_lp[:update_len][new_is_better] = l # Update length where improvement occurred
+
+            count_updated = torch.sum(new_is_better).item()
+            print(f"Length l={l}: Updated {count_updated} VALMAP entries.")
+
+
+        end_time_total = time.time()
+        print(f"VALMOD prediction finished in {end_time_total - start_time_total:.2f} seconds.")
+
+        # Check if any valid matches were found at all
+        if torch.all(torch.isinf(self.valmap_mpn)):
+            print("Warning: No valid non-trivial matches found across the specified length range.")
+            return None, None, None
+
+        return self.valmap_mpn, self.valmap_ip, self.valmap_lp
+
+    def get_top_k_motifs(self, k=1, overlap_threshold=0.5):
+        """
+        Finds the top K distinct motif pairs from the calculated VALMAP.
+        Attempts to filter out motifs that highly overlap with already selected ones.
+
+        Args:
+            k (int): The number of top motifs to return.
+            overlap_threshold (float): Maximum allowed overlap ratio between motifs' intervals
+                                      (0 means no overlap, 1 means full overlap allowed).
+                                      Overlap is checked based on index ranges.
+
+        Returns:
+            list: A list of tuples, where each tuple is
+                  (normalized_distance, index1, index2, length).
+                  Returns an empty list if predict() hasn't been run or no motifs found.
+        """
+        if self.valmap_mpn is None or self.valmap_ip is None or self.valmap_lp is None:
+            print("Error: VALMAP not computed. Run predict() first.")
+            return []
+
+        if torch.all(torch.isinf(self.valmap_mpn)) or torch.all(self.valmap_ip == -1):
+             print("Warning: VALMAP contains no valid matches.")
+             return []
+
+
+        # Sort the VALMAP normalized distances to find potential candidates
+        sorted_distances, sorted_indices = torch.sort(self.valmap_mpn)
+
+        top_k_list = []
+        added_intervals = [] # Stores tuples of (start, end) for selected motifs
+
+        for i in range(len(sorted_distances)):
+            idx1 = sorted_indices[i].item()
+            dist_norm = sorted_distances[i].item()
+
+            # Skip if this distance is infinite (no valid match for this starting point)
+            if np.isinf(dist_norm):
+                continue
+
+            idx2 = self.valmap_ip[idx1].item()
+            length = self.valmap_lp[idx1].item()
+
+            # Skip if the match index is invalid (-1)
+            if idx2 == -1:
+                continue
+
+            # --- Overlap Check ---
+            # Define intervals for the potential new motif pair
+            interval1 = (idx1, idx1 + length)
+            interval2 = (idx2, idx2 + length)
+
+            is_overlapping = False
+            for existing_interval1, existing_interval2 in added_intervals:
+                # Check overlap of interval1 with existing_interval1 OR existing_interval2
+                # Check overlap of interval2 with existing_interval1 OR existing_interval2
+                # (More robust check needed for true motif similarity, this is index-based)
+
+                def check_interval_overlap(intA_start, intA_end, intB_start, intB_end, threshold, length_a, length_b):
+                    overlap_start = max(intA_start, intB_start)
+                    overlap_end = min(intA_end, intB_end)
+                    overlap_len = max(0, overlap_end - overlap_start)
+                    min_len = min(length_a, length_b) # Use min length for ratio denominator
+                    if min_len == 0: return False # Avoid division by zero
+                    # Check if overlap ratio exceeds threshold relative to *shorter* segment
+                    return (overlap_len / min_len) > threshold
+
+                len1 = interval1[1] - interval1[0]
+                len2 = interval2[1] - interval2[0]
+                ex_len1 = existing_interval1[1] - existing_interval1[0]
+                ex_len2 = existing_interval2[1] - existing_interval2[0]
+
+                # Check overlap of new pair with an existing pair
+                overlap11 = check_interval_overlap(interval1[0], interval1[1], existing_interval1[0], existing_interval1[1], overlap_threshold, len1, ex_len1)
+                overlap12 = check_interval_overlap(interval1[0], interval1[1], existing_interval2[0], existing_interval2[1], overlap_threshold, len1, ex_len2)
+                overlap21 = check_interval_overlap(interval2[0], interval2[1], existing_interval1[0], existing_interval1[1], overlap_threshold, len2, ex_len1)
+                overlap22 = check_interval_overlap(interval2[0], interval2[1], existing_interval2[0], existing_interval2[1], overlap_threshold, len2, ex_len2)
+
+                if overlap11 or overlap12 or overlap21 or overlap22:
+                    is_overlapping = True
+                    break # Overlaps significantly with an existing motif pair
+
+            if not is_overlapping:
+                # Ensure idx1 < idx2 for consistency
+                final_idx1, final_idx2 = min(idx1, idx2), max(idx1, idx2)
+                motif_tuple = (dist_norm, final_idx1, final_idx2, length)
+                top_k_list.append(motif_tuple)
+                added_intervals.append( ( (final_idx1, final_idx1 + length), (final_idx2, final_idx2 + length) ) ) # Add both intervals
+
+            if len(top_k_list) >= k:
+                break # Found enough distinct motifs
+
+        return top_k_list
+
+# --- Main Execution & Plotting ---
+if __name__ == "__main__":
+    # --- Simulation Parameters ---
+    N_POINTS = 1000
+    LMIN = 30      # Minimum motif length
+    LMAX = 100     # Maximum motif length
+    K_MOTIFS = 3   # Number of top motifs to find
+    USE_GPU = True # Set to True to attempt GPU usage
+
+    # (1) Generate Data
+    print("Simulating time series data...")
+    simulated_data = simulate_time_series_variable_motifs(n_points=N_POINTS, seed=123)
+    print(f"Simulated data shape: {simulated_data.shape}")
+
+    # --- VALMOD Detection ---
+    # (4) Instantiate and Run VALMOD
+    compute_device = 'cuda' if USE_GPU else 'cpu'
+    valmod_detector = Valmod(lmin=LMIN, lmax=LMAX, device=compute_device)
+    valmap_mpn, valmap_ip, valmap_lp = valmod_detector.predict(simulated_data)
+
+    if valmap_mpn is not None:
+        print("VALMAP computed successfully.")
+        # --- Extract Top-K Motifs ---
+        top_motifs = valmod_detector.get_top_k_motifs(k=K_MOTIFS, overlap_threshold=0.1) # Use a stricter overlap threshold
+
+        if top_motifs:
+            print(f"\nTop {len(top_motifs)} Motif(s) Found:")
+            for i, (dist, idx1, idx2, length) in enumerate(top_motifs):
+                print(f"  Motif {i+1}:")
+                print(f"    Normalized Distance: {dist:.4f}")
+                print(f"    Index 1 (start):    {idx1}")
+                print(f"    Index 2 (start):    {idx2}")
+                print(f"    Length:             {length}")
+        else:
+            print("\nNo valid motifs could be extracted from VALMAP.")
+
+        # --- Plotting ---
+        # (5) Plot original data and highlight the detected motif pairs
+        fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
+        fig.suptitle(f'VALMOD Variable Length Motif Detection (lmin={LMIN}, lmax={LMAX}, k={K_MOTIFS})', fontsize=16)
+
+        # Plot 1: Original Time Series with Top Motifs Highlighted
+        axes[0].plot(valmod_detector.data_tensor.cpu().numpy(), label='Original Time Series', color='grey', alpha=0.7, zorder=1)
+        axes[0].set_title('Original Data and Detected Top Motif Pair(s)')
+        axes[0].set_ylabel('Value')
+
+        colors = plt.cm.viridis(np.linspace(0, 0.8, K_MOTIFS)) # Use a colormap
+
+        if top_motifs:
+            for i, (dist, idx1, idx2, length) in enumerate(top_motifs):
+                 # Ensure indices are within bounds
+                 if idx1 + length <= valmod_detector.data_len and idx2 + length <= valmod_detector.data_len:
+                     label1 = f'Motif {i+1}a (idx:{idx1}, len:{length})' if i == 0 else f'{i+1}a'
+                     label2 = f'Motif {i+1}b (idx:{idx2}, len:{length})' if i == 0 else f'{i+1}b'
+                     axes[0].plot(range(idx1, idx1 + length), valmod_detector.data_tensor[idx1:idx1+length].cpu().numpy(), color=colors[i], linewidth=2.5, label=label1, zorder=i+2)
+                     axes[0].plot(range(idx2, idx2 + length), valmod_detector.data_tensor[idx2:idx2+length].cpu().numpy(), color=colors[i], linewidth=2.5, linestyle='--', label=label2, zorder=i+2)
+            axes[0].legend(loc='upper right', fontsize='small')
+        else:
+             axes[0].plot([], [], label='No Motifs Found') # Add label for clarity
+             axes[0].legend(loc='upper right')
+
+
+        # Plot 2: VALMAP Normalized Distance Profile (MPn)
+        mpn_numpy = valmap_mpn.cpu().numpy() # Convert to numpy for plotting
+        x_axis_mpn = range(len(mpn_numpy)) # MPn starts at index 0
+        axes[1].plot(x_axis_mpn, mpn_numpy, label='VALMAP MPn (Final Best Normalized Distance)', color='blue', zorder=1)
+        # Mark the locations of the top motifs' starting points
+        if top_motifs:
+            for i, (dist, idx1, idx2, length) in enumerate(top_motifs):
+                 # idx1 and idx2 are indices in the original series,
+                 # need to check if they correspond to valid indices in MPn
+                 # MPn index corresponds to original series index
+                 if idx1 < len(mpn_numpy):
+                     axes[1].plot(idx1, mpn_numpy[idx1], '*', color=colors[i], markersize=10, label=f'Motif {i+1} Start (idx:{idx1})', zorder=i+2)
+
+        axes[1].set_title('VALMAP Normalized Distance Profile (MPn)')
+        axes[1].set_ylabel('Normalized Distance')
+        # axes[1].legend(loc='upper right', fontsize='small')
+        axes[1].set_ylim(bottom=0) # Distances are non-negative
+
+
+        # Plot 3: VALMAP Length Profile (LP)
+        lp_numpy = valmap_lp.cpu().numpy() # Convert to numpy for plotting
+        x_axis_lp = range(len(lp_numpy)) # LP starts at index 0
+        axes[2].plot(x_axis_lp, lp_numpy, label='VALMAP LP (Final Best Motif Length)', color='green', linestyle='-', marker='.', markersize=3, zorder=1)
+        # Mark the length corresponding to the top motifs
+        if top_motifs:
+             for i, (dist, idx1, idx2, length) in enumerate(top_motifs):
+                 if idx1 < len(lp_numpy):
+                     axes[2].plot(idx1, lp_numpy[idx1], '*', color=colors[i], markersize=10, label=f'Motif {i+1} Length ({length})', zorder=i+2)
+
+        axes[2].set_title('VALMAP Length Profile (LP)')
+        axes[2].set_ylabel('Length')
+        axes[2].set_xlabel('Starting Index of Subsequence')
+        # axes[2].legend(loc='upper right', fontsize='small')
+        # Set reasonable y-axis limits based on lmin/lmax
+        axes[2].set_ylim(max(0, LMIN - 5), LMAX + 5)
+
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent title overlap
+        plt.show()
+
+    else:
+        print("VALMOD prediction failed. Cannot plot results.")
